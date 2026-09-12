@@ -104,6 +104,12 @@ float gF_PauseVelocity[MAXPLAYERS+1][3];
 int gI_HijackFrames[MAXPLAYERS+1];
 float gF_HijackedAngles[MAXPLAYERS+1][2];
 
+// usercmds that were already in-flight when we teleported the player with velocity.
+// they still hold the keys the player pressed before the teleport, and the engine would happily
+// use them to accelerate against (i.e. delete) the velocity we just gave them.
+// during these ticks, movement input that opposes the player's velocity is ignored.
+int gI_TeleportNoBrakeFrames[MAXPLAYERS+1];
+
 // used for offsets
 float gF_SmallestDist[MAXPLAYERS + 1];
 float gF_Origin[MAXPLAYERS + 1][2][3];
@@ -144,6 +150,7 @@ Convar gCV_TimeInMessages;
 Convar gCV_DebugOffsets = null;
 Convar gCV_SaveIps = null;
 Convar gCV_HijackTeleportAngles = null;
+Convar gCV_TeleportNoBrake = null;
 // cached cvars
 int gI_DefaultStyle = 0;
 bool gB_StyleCookies = true;
@@ -403,6 +410,7 @@ public void OnPluginStart()
 	gCV_DebugOffsets = new Convar("shavit_core_debugoffsets", "0", "Print offset upon leaving or entering a zone?", 0, true, 0.0, true, 1.0);
 	gCV_SaveIps = new Convar("shavit_core_save_ips", "1", "Whether to save player IPs in the 'users' database table. IPs are used to show player location on the !profile menu.\nTurning this off will not wipe existing IPs from the 'users' table.", 0, true, 0.0, true, 1.0);
 	gCV_HijackTeleportAngles = new Convar("shavit_core_hijack_teleport_angles", "0", "Whether to hijack player angles on teleport so their latency doesn't fuck up their shit.", 0, true, 0.0, true, 1.0);
+	gCV_TeleportNoBrake = new Convar("shavit_core_teleport_no_brake", "1", "Whether to ignore movement input that opposes the player's velocity for the client's latency window after a teleport that moves them and gives them velocity.\nWithout this, usercmds that were already in-flight (i.e. the keys they held before teleporting) let the engine accelerate against the velocity the teleport gave them.\nInput that doesn't oppose their velocity (e.g. strafes that gain speed) is left alone.", 0, true, 0.0, true, 1.0);
 	gCV_DefaultStyle.AddChangeHook(OnConVarChanged);
 
 	Anti_sv_cheats_cvars();
@@ -2785,6 +2793,7 @@ public void OnClientPutInServer(int client)
 	gI_FirstTouchedGroundForStartTimer[client] = 0;
 	gI_LastTickcount[client] = 0;
 	gI_HijackFrames[client] = 0;
+	gI_TeleportNoBrakeFrames[client] = 0;
 	gI_LastPrintedSteamID[client] = 0;
 
 	gB_CookiesRetrieved[client] = false;
@@ -2888,6 +2897,30 @@ public MRESReturn DHooks_OnTeleport(int pThis, DHookParam hParams)
 			hParams.GetVector(2, angles);
 			gF_HijackedAngles[pThis][0] = angles[0];
 			gF_HijackedAngles[pThis][1] = angles[1];
+		}
+	}
+
+	// A teleport that both moves the player and hands them velocity (checkpoints, persistent data).
+	// The usercmds that were already in-flight still hold whatever keys the player was pressing
+	// before, and the engine will gladly accelerate against the velocity we just gave them.
+	// `AirAccelerate` caps at `30 - dot(velocity, wishdir)`, which is ~1030 when wishdir opposes a
+	// 1000u/s velocity, so a few of those cmds are enough to eat all of it.
+	// OnPlayerRunCmd drops the opposing part of their input for these ticks (see the end of it).
+	// Velocity-only teleports (slide zones) pass no position and are left alone, as are the
+	// zero-velocity ones (restarts, spawns, kz checkpoints).
+	if (gCV_TeleportNoBrake.BoolValue && !hParams.IsNull(1) && !hParams.IsNull(3) && IsPlayerAlive(pThis))
+	{
+		float velocity[3];
+		hParams.GetVector(3, velocity);
+
+		if (velocity[0] != 0.0 || velocity[1] != 0.0)
+		{
+			int ticks = RoundToCeil(GetClientLatency(pThis, NetFlow_Both) / GetTickInterval()) + 1;
+
+			if (ticks < 1) ticks = 1;
+			if (ticks > 32) ticks = 32; // don't take control away from a spiking client for ages
+
+			gI_TeleportNoBrakeFrames[pThis] = ticks;
 		}
 	}
 
@@ -3385,6 +3418,16 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 		angles[1] = gF_HijackedAngles[client][1];
 	}
 
+	// see DHooks_OnTeleport - this cmd may have been sent before the client knew they were teleported.
+	// counted down here so early returns don't stretch the window; applied at the end of the function.
+	bool bPreventBraking = false;
+
+	if (gI_TeleportNoBrakeFrames[client])
+	{
+		--gI_TeleportNoBrakeFrames[client];
+		bPreventBraking = true;
+	}
+
 	// Wait till now to return so spectators can free-cam while paused...
 	if(!IsPlayerAlive(client))
 	{
@@ -3768,10 +3811,43 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 	}
 #endif
 
+	// Drop whichever movement axis points against the velocity a teleport just gave the player,
+	// instead of letting stale input brake it off. Strafes that gain speed are left alone.
+	// Done per axis (never projecting wishvel) so we can't invent a key the player isn't holding,
+	// which would trip the +strafe check or sneak past a style's key restrictions.
+	// This runs after every check above, so it only ever narrows input core already accepted.
+	bool bChangedInput = false;
+
+	if (bPreventBraking && (vel[0] != 0.0 || vel[1] != 0.0))
+	{
+		float fVelocity[3];
+		GetEntPropVector(client, Prop_Data, "m_vecAbsVelocity", fVelocity);
+		fVelocity[2] = 0.0;
+
+		// `angles` is what the engine will actually move with (after hijacking & Shavit_OnUserCmdPre).
+		// only the sign of the dot products matters, so nothing needs normalizing.
+		float fForward[3], fRight[3];
+		GetAngleVectors(angles, fForward, fRight, NULL_VECTOR);
+		fForward[2] = 0.0;
+		fRight[2] = 0.0;
+
+		if (vel[0] * GetVectorDotProduct(fForward, fVelocity) < 0.0)
+		{
+			vel[0] = 0.0;
+			bChangedInput = true;
+		}
+
+		if (vel[1] * GetVectorDotProduct(fRight, fVelocity) < 0.0)
+		{
+			vel[1] = 0.0;
+			bChangedInput = true;
+		}
+	}
+
 	gA_Timers[client].bJumped = false;
 	gA_Timers[client].bOnGround = bOnGround;
 
-	return Plugin_Continue;
+	return bChangedInput ? Plugin_Changed : Plugin_Continue;
 }
 
 public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float vel[3], const float angles[3], int weapon, int subtype, int cmdnum, int tickcount, int seed, const int mouse[2])
